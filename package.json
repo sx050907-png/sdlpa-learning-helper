@@ -1,0 +1,11 @@
+{
+  "name": "sdlpa-learning-helper",
+  "version": "0.5.1",
+  "private": true,
+  "license": "MIT",
+  "scripts": {
+    "build": "node work/build-extension.cjs",
+    "test": "node --jitless work/test-helper.cjs && node --jitless work/test-extension.cjs",
+    "package": "node work/build-store.cjs"
+  }
+}

@@ -1,0 +1,7 @@
+**/node_modules/
+work/extension-staging/
+outputs/Edge*/
+*.log
+.env
+.env.*
+!.env.example
