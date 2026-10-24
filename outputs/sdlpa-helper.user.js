@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         山东药师继续教育助手
 // @namespace    local.sdlpa.helper
-// @version      0.5.1
+// @version      0.5.2
 // @description  平台完成状态检测、提前切换、静音播放、普通签到和自定义 AI 练习辅助
 // @match        https://training.sdlpa.org.cn/*
 // @run-at       document-idle
@@ -25,6 +25,7 @@
   }
 })(function () {
   'use strict';
+  const VERSION = '0.5.2';
   const DEFAULTS = {
     autoNext: true, completeEarly: true, mute: false, autoCheckin: true, autoResume: true, aiEnabled: false,
     autoPracticeSubmit: false, examNext: false, provider: 'custom', baseUrl: '', model: '', apiKey: ''
@@ -160,7 +161,8 @@
     const cfg = { ...DEFAULTS, ...storage.get('sdlpa-helper-settings-v1', {}) };
     const state = {
       running: false, status: '就绪，点击开始', busyAI: false, generation: 0,
-      answered: new Set(), pendingEnd: null, completionReady: null, actionAt: 0, selectAt: 0,
+      answered: new Set(), examAnswers: new Map(), examNavigation: null, examVisit: null,
+      pendingEnd: null, completionReady: null, actionAt: 0, selectAt: 0,
       lastPath: win.location.pathname, error: '', disposed: false,
       listWaitAt: null, autoplayBlocked: false, playPending: false
     };
@@ -178,7 +180,7 @@
       .actions{display:flex;gap:7px;margin:8px 0}label{display:block;margin:5px 0}select,input[type=text],input[type=password]{width:100%;padding:6px;border:1px solid #c3cfdd;border-radius:4px}
       details{border-top:1px solid #e3e9f0;padding-top:8px;margin-top:8px}summary{cursor:pointer}.muted{font-size:12px;color:#65758a}.error{color:#b42318}.answer{max-height:120px;overflow:auto}
       header button{padding:0 7px;color:#fff;background:transparent;border-color:#ffffff66}main[hidden]{display:none}
-    </style><section><header title="按住标题栏拖动；位置会自动保存">山东药师学习助手 0.5.0 <button id="fold" aria-label="收起面板">−</button></header><main>
+    </style><section><header title="按住标题栏拖动；位置会自动保存">山东药师学习助手 ${VERSION} <button id="fold" aria-label="收起面板">−</button></header><main>
       <p id="status" role="status"></p><p id="chapter" class="muted"></p><p id="error" class="error"></p>
       <div class="actions"><button class="primary" id="start">开始</button><button id="stop">停止</button><button id="retry">重试本题</button></div>
       <label><input type="checkbox" data-key="autoNext">完成后继续下一章节／未完成课程</label>
@@ -186,6 +188,7 @@
       <label><input type="checkbox" data-key="mute">静音播放</label>
       <label><input type="checkbox" data-key="autoCheckin">自动点击普通签到</label>
       <label><input type="checkbox" data-key="autoResume">自动处理离开页面暂停提示</label>
+      <label><input type="checkbox" data-key="examNext">AI 填写后继续下一题（不交卷）</label>
       <details><summary>AI 接口与练习设置</summary>
         <p class="muted">兼容 OpenAI Chat Completions 格式。题目和选项只发给你填写的接口；Key 保存在脚本管理器本地。</p>
         <label>服务商<select id="provider" data-key="provider">${Object.entries(PRESETS).map(([key,p]) => `<option value="${key}">${p.name}</option>`).join('')}</select></label>
@@ -194,7 +197,6 @@
         <label>API Key<input type="password" data-key="apiKey" autocomplete="off"></label>
         <label><input type="checkbox" data-key="aiEnabled">启用 AI 识别并填写练习</label>
         <label><input type="checkbox" data-key="autoPracticeSubmit">随堂小测验填写后自动提交</label>
-        <label><input type="checkbox" data-key="examNext">课后测验填写后继续下一题</label>
         <p class="muted">AI 答案可能出错。课后测验的最终交卷、课程评价和身份验证需你操作。</p>
         <button id="save">保存设置</button> <button id="test">测试接口</button><p id="saved" class="muted"></p>
       </details><p id="answer" class="answer muted"></p>
@@ -252,13 +254,14 @@
         if (input.dataset.key === 'mute') for (const video of doc.querySelectorAll('video')) video.muted = cfg.mute;
         if (input.dataset.key === 'completeEarly') state.completionReady = null;
         storage.set('sdlpa-helper-settings-v1', { ...cfg });
+        if (input.dataset.key === 'examNext' && state.running) tick();
       });
     }
     const status = message => { state.status = message; $('status').textContent = message; };
     $('provider').onchange = () => {
       cfg.provider = $('provider').value;
       cfg.baseUrl = PRESETS[cfg.provider].baseUrl; cfg.model = ''; cfg.apiKey = ''; cfg.aiEnabled = false;
-      state.generation++; state.answered.clear();
+      state.generation++; state.answered.clear(); state.examAnswers.clear(); state.examNavigation = null;
       for (const key of ['baseUrl', 'model', 'apiKey']) ui.querySelector(`[data-key="${key}"]`).value = cfg[key];
       ui.querySelector('[data-key="aiEnabled"]').checked = false;
       $('saved').textContent = '服务商已切换。请填写该服务商的模型和 Key，保存后再启用 AI。';
@@ -285,6 +288,7 @@
     function start() {
       state.running = true; state.error = ''; $('error').textContent = '';
       state.completionReady = null;
+      state.examNavigation = null;
       state.generation++; state.autoplayBlocked = false; status('运行中'); tick();
       if (!visibleDialogs().length && !readQuiz(doc, win.location.pathname)) play(doc.querySelector('video'));
     }
@@ -308,7 +312,8 @@
       finally { state.busyAI = false; $('test').disabled = false; }
     };
     $('retry').onclick = () => {
-      const q = readQuiz(doc, win.location.pathname); if (q) state.answered.delete(q.signature);
+      const q = readQuiz(doc, win.location.pathname);
+      if (q) { state.answered.delete(q.signature); state.examAnswers.delete(q.signature); }
       state.error = ''; $('error').textContent = ''; start();
     };
     const videoListeners = new Map();
@@ -344,9 +349,37 @@
       } else status('等待你处理平台提示：' + m.message.slice(0, 100));
       return true;
     }
+    function continueExam(quiz, answers) {
+      if (!state.running || !cfg.aiEnabled || win.location.pathname !== '/exam') return;
+      if (!cfg.examNext) { status('AI 已填写；勾选“AI 填写后继续下一题”可自动继续，最终交卷需手动'); return; }
+      if (visibleDialogs().length) return;
+      const live = readQuiz(doc, win.location.pathname);
+      if (!live || live.signature !== quiz.signature) return;
+      const chosen = live.options.filter(o => o.input.checked).map(o => o.index);
+      if (chosen.length !== answers.length || chosen.some(n => !answers.includes(n))) {
+        status('本题选项已变动，未自动下一题；请核对或点击“重试本题”'); return;
+      }
+      if (state.examNavigation?.signature === live.signature) {
+        status(clock() - state.examNavigation.at > 10000 ? '已点击下一题但题目未更新，请检查页面或重试本题' : '已点击下一题，等待新题加载');
+        return;
+      }
+      // Some layouts put navigation above/outside the question box. On this
+      // route, only one exact, visible, enabled Next button may be clicked.
+      const candidates = Array.from(doc.querySelectorAll('button'))
+        .filter(b => clean(b.textContent) === '下一题' && enabled(b) && shown(b));
+      if (candidates.length !== 1) {
+        status(candidates.length ? '发现多个下一题按钮，请手动确认' : '本题已填写，等待可用的下一题按钮；全部答完请自行交卷'); return;
+      }
+      state.examNavigation = { signature: live.signature, at: clock() };
+      candidates[0].click(); status('本题全部选项已核对，已点击下一题，等待新题加载');
+    }
     async function solve(quiz) {
       if (!cfg.aiEnabled) { status('已发现练习；可填写 AI 设置并启用'); return; }
-      if (state.busyAI || state.answered.has(quiz.signature)) return;
+      if (state.busyAI) return;
+      if (quiz.kind === 'exam' && state.examAnswers.has(quiz.signature)) {
+        continueExam(quiz, state.examAnswers.get(quiz.signature)); return;
+      }
+      if (state.answered.has(quiz.signature)) return;
       const generation = state.generation;
       state.busyAI = true; state.answered.add(quiz.signature); status('正在请求 AI 解答当前题目');
       try {
@@ -360,7 +393,10 @@
           if (option.input.checked !== selected && (live.multiple || selected)) option.el.click();
         }
         await Promise.resolve();
-        const chosen = live.options.filter(o => o.input.checked).map(o => o.index);
+        const applied = readQuiz(doc, win.location.pathname);
+        if (!state.running || !cfg.aiEnabled || generation !== state.generation || applied?.signature !== quiz.signature) return;
+        if (visibleDialogs().some(d => d !== applied.root)) return;
+        const chosen = applied.options.filter(o => o.input.checked).map(o => o.index);
         if (chosen.length !== answer.answers.length || chosen.some(n => !answer.answers.includes(n)))
           throw new Error('页面未接受答案选择，已停止自动提交');
         $('answer').textContent = 'AI 选择：' + answer.answers.join('、') + '。' + answer.explanation;
@@ -368,10 +404,9 @@
           const submit = exactButton(live.root, '提交答案');
           if (!submit) throw new Error('未找到随堂练习提交按钮');
           submit.click(); status('随堂练习已提交，等待平台反馈');
-        } else if (live.kind === 'exam' && cfg.examNext) {
-          const next = exactButton(live.root, '下一题');
-          if (next) { next.click(); status('本题已填写，继续识别下一题'); }
-          else status('本题已填写，请核对全部答案并自行交卷');
+        } else if (applied.kind === 'exam') {
+          state.examAnswers.set(applied.signature, [...answer.answers]);
+          continueExam(applied, answer.answers);
         } else status('AI 已填写，请核对并提交');
       } catch (e) { if (state.running && generation === state.generation) fail(e.message); }
       finally { state.busyAI = false; }
@@ -414,7 +449,7 @@
       bindVideos();
       if (state.lastPath !== win.location.pathname) {
         state.lastPath = win.location.pathname; state.generation++; state.pendingEnd = null;
-        state.completionReady = null;
+        state.completionReady = null; state.examAnswers.clear(); state.examNavigation = null; state.examVisit = null;
         state.listWaitAt = null; state.autoplayBlocked = false;
       }
       const list = chapters(doc), current = list.find(c => c.selected);
@@ -425,7 +460,10 @@
       if (dialogs.length) state.completionReady = null;
       for (const dialog of dialogs) if (handleDialog(dialog)) return;
       const quiz = readQuiz(doc, win.location.pathname);
-      if (quiz) { solve(quiz); return; }
+      if (quiz) {
+        if (state.examVisit !== quiz.signature) { state.examVisit = quiz.signature; state.examNavigation = null; }
+        solve(quiz); return;
+      }
       if (visibleDialogs().some(d => /小测验/.test(d.querySelector('.el-dialog__title')?.textContent || ''))) {
         status('发现小测验，但无法完整识别题干或选项，请人工处理'); return;
       }
@@ -483,5 +521,5 @@
       host.remove();
     } };
   }
-  return { PRESETS, install, readChapter, chapters, nextChapter, classifyMessage, readQuiz, endpoint, parseAnswer, requestAnswer, shown };
+  return { VERSION, PRESETS, install, readChapter, chapters, nextChapter, classifyMessage, readQuiz, endpoint, parseAnswer, requestAnswer, shown };
 });

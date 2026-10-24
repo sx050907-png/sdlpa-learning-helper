@@ -8,6 +8,11 @@ const chapter = (name, status, selected = false, video = true) => `<li><button c
 const message = text => `<div class="el-message-box"><div class="el-message-box__message">${text}</div><button>签到</button><button>确定</button></div>`;
 const quiz = (name = '哪一项是正确选项？', multiple = false) => `<div class="el-dialog"><span class="el-dialog__title">测试课件 - 小测验</span><p class="subject-title">(${multiple ? '多选题' : '单选题'})</p><div class="subject-title">${name}</div>${['甲', '乙', '丙'].map((x, i) => `<label class="subject-option"><input type="${multiple ? 'checkbox' : 'radio'}" name="answer" value="${i}">${x}</label>`).join('')}<button>提交答案</button></div>`;
 const exam = `<div class="exam-box"><div class="qyui-cell col"><div class="subject-seq">1、</div><div>(单选题)</div><div>请选择正确项目</div></div><label class="subject-option"><input type="radio" name="exam">A、甲</label><label class="subject-option"><input type="radio" name="exam">B、乙</label><button>下一题</button><button>交卷</button></div>`;
+// Reproduction fixture from the reported layout, not a live DOM snapshot.
+const examPage = (multiple = false, next = '<button id="exam-next"><span>下一题</span></button>') =>
+  `<section><nav>${next}<button id="exam-submit">交卷</button></nav><div class="exam-box"><div class="qyui-cell col"><div class="subject-seq">1、</div><div>(${multiple ? '多选题' : '单选题'})</div><div>当前练习题</div></div>${['甲','乙','丙','丁','戊'].map((text,i)=>`<label class="subject-option"><input type="${multiple ? 'checkbox' : 'radio'}" name="exam">${'ABCDE'[i]}、${text}</label>`).join('')}</div></section>`;
+const aiSettings = { aiEnabled:true, examNext:true, baseUrl:'https://example.org/v1', model:'test' };
+const answerResponse = answers => ({status:200,responseText:JSON.stringify({choices:[{message:{content:JSON.stringify({answers})}}]})});
 function setup(html = '', settings = {}, pathname = '/learn', request) {
   const dom = new JSDOM(html, { url: 'https://training.sdlpa.org.cn' + pathname, pretendToBeVisual: true });
   let now = 100000;
@@ -222,6 +227,90 @@ test('课后测验始终不自动交卷', async () => {
   const t = setup(exam, { aiEnabled: true, examNext: true, baseUrl: 'https://example.org/v1', model: 'test' }, '/exam', r => r.onload({ status: 200, responseText: JSON.stringify({ choices: [{ message: { content: '{"answers":[1]}' } }] }) }));
   let next = 0, submit = 0; const buttons = t.doc.querySelectorAll('.exam-box button'); buttons[0].onclick = () => next++; buttons[1].onclick = () => submit++;
   t.ctrl.start(); await t.flush(); assert.equal(next, 1); assert.equal(submit, 0); t.close();
+});
+
+test('题框外的下一题按钮：完整多选、清除多余项后才翻页，不重复点击或请求', async () => {
+  let requests=0, sent, next=0, submit=0;
+  const t=setup(examPage(true),aiSettings,'/exam',r=>{requests++;sent=JSON.parse(JSON.parse(r.data).messages[1].content);r.onload(answerResponse([1,2,4]));});
+  const inputs=Array.from(t.doc.querySelectorAll('input')); inputs[2].checked=true;
+  t.doc.getElementById('exam-next').onclick=()=>{assert.deepEqual(inputs.flatMap((x,i)=>x.checked?[i+1]:[]),[1,2,4]);next++;};
+  t.doc.getElementById('exam-submit').onclick=()=>submit++;
+  t.ctrl.start();await t.flush();t.ctrl.tick();t.advance(15000);t.ctrl.tick();await t.flush();
+  assert.equal(sent.multiple,true);assert.equal(next,1);assert.equal(submit,0);assert.equal(requests,1);t.close();
+});
+
+test('AI 填完后再开启下一题：使用已核对的本题答案继续，不重复扣费', async () => {
+  let requests=0,next=0;
+  const t=setup(examPage(),{...aiSettings,examNext:false},'/exam',r=>{requests++;r.onload(answerResponse([2]));});
+  t.doc.getElementById('exam-next').onclick=()=>next++;
+  t.ctrl.start();await t.flush();assert.equal(next,0);assert.match(t.ctrl.state.status,/勾选/);
+  const toggle=t.ctrl.ui.querySelector('[data-key="examNext"]');assert.equal(toggle.closest('details'),null);
+  toggle.checked=true;toggle.dispatchEvent(new t.dom.window.Event('change'));await t.flush();
+  assert.equal(next,1);assert.equal(requests,1);t.close();
+});
+
+test('下一题按钮暂时禁用或尚未出现：后续检测可继续，隐藏按钮不干扰', async () => {
+  let requests=0,next=0;
+  const t=setup(examPage(false,'<button id="exam-next" disabled>下一题</button><div hidden><button>下一题</button></div>'),aiSettings,'/exam',r=>{requests++;r.onload(answerResponse([1]));});
+  t.doc.getElementById('exam-next').onclick=()=>next++;
+  t.ctrl.start();await t.flush();assert.equal(next,0);
+  t.doc.getElementById('exam-next').disabled=false;t.ctrl.tick();await t.flush();
+  assert.equal(next,1);assert.equal(requests,1);t.close();
+  const delayed=setup(examPage(false,''),aiSettings,'/exam',r=>r.onload(answerResponse([1])));
+  let later=0;delayed.ctrl.start();await delayed.flush();const button=delayed.doc.createElement('button');button.textContent='下一题';button.onclick=()=>later++;delayed.doc.querySelector('nav').append(button);
+  delayed.ctrl.tick();assert.equal(later,1);delayed.close();
+});
+
+test('多选未被页面完整接受：停止并保留本题，不能只选一项就翻页', async () => {
+  const t=setup(examPage(true),aiSettings,'/exam',r=>r.onload(answerResponse([1,2,4])));let next=0;
+  t.doc.querySelectorAll('label')[1].addEventListener('click',e=>e.preventDefault());t.doc.getElementById('exam-next').onclick=()=>next++;
+  t.ctrl.start();await t.flush();assert.equal(next,0);assert.equal(t.ctrl.state.running,false);assert.match(t.ctrl.state.error,/页面未接受/);t.close();
+});
+
+test('人工修改多选结果后开启下一题：保持人工选择并提示，不代替用户判断完成', async () => {
+  const t=setup(examPage(true),{...aiSettings,examNext:false},'/exam',r=>r.onload(answerResponse([1,2,4])));let next=0;
+  t.doc.getElementById('exam-next').onclick=()=>next++;t.ctrl.start();await t.flush();
+  t.doc.querySelectorAll('input')[1].checked=false;const toggle=t.ctrl.ui.querySelector('[data-key="examNext"]');toggle.checked=true;toggle.dispatchEvent(new t.dom.window.Event('change'));
+  assert.equal(next,0);assert.match(t.ctrl.state.status,/选项已变动/);t.close();
+});
+
+test('人工仅选择多选的一项、AI 关闭时不擅自翻页', async () => {
+  const t=setup(examPage(true),{...aiSettings,aiEnabled:false},'/exam');let next=0;
+  t.doc.querySelectorAll('input')[3].checked=true;t.doc.getElementById('exam-next').onclick=()=>next++;
+  t.ctrl.start();t.ctrl.tick();await t.flush();assert.equal(next,0);t.close();
+});
+
+test('最后一题没有下一题时：持续保留答案，绝不点击交卷', async () => {
+  const t=setup(examPage(false,''),aiSettings,'/exam',r=>r.onload(answerResponse([1])));let submit=0;
+  t.doc.getElementById('exam-submit').onclick=()=>submit++;t.ctrl.start();await t.flush();t.ctrl.tick();t.advance(15000);t.ctrl.tick();
+  assert.equal(submit,0);assert.match(t.ctrl.state.status,/自行交卷/);assert.equal(t.doc.querySelector('input').checked,true);t.close();
+});
+
+test('选项事件期间点击停止或关闭 AI：不再点击下一题', async () => {
+  for (const action of ['stop','disableAI']) {
+    const t=setup(examPage(),aiSettings,'/exam',r=>r.onload(answerResponse([1])));let next=0;
+    t.doc.querySelector('label').addEventListener('click',()=>{if(action==='stop')t.ctrl.stop();else {const toggle=t.ctrl.ui.querySelector('[data-key="aiEnabled"]');toggle.checked=false;toggle.dispatchEvent(new t.dom.window.Event('change'));}});
+    t.doc.getElementById('exam-next').onclick=()=>next++;t.ctrl.start();await t.flush();t.ctrl.tick();assert.equal(next,0,action);t.close();
+  }
+});
+
+test('遇到两个可见下一题按钮时等待人工确认', async () => {
+  const t=setup(examPage(false,'<button id="exam-next">下一题</button><button>下一题</button>'),aiSettings,'/exam',r=>r.onload(answerResponse([1])));let next=0;
+  for (const button of t.doc.querySelectorAll('nav button')) button.onclick=()=>next++;
+  t.ctrl.start();await t.flush();assert.equal(next,0);assert.match(t.ctrl.state.status,/多个下一题/);t.close();
+});
+
+test('第一题切到第二题：重新识别题型及完整答案，每题只翻页一次', async () => {
+  let requests=0,next=0;
+  const t=setup(examPage(true),aiSettings,'/exam',r=>{requests++;r.onload(answerResponse(requests===1?[1,2,4]:[3,5]));});
+  t.doc.getElementById('exam-next').onclick=()=>{next++;if(next===1){t.doc.querySelector('.subject-seq').textContent='2、';for(const input of t.doc.querySelectorAll('input'))input.checked=false;}};
+  t.ctrl.start();await t.flush();t.ctrl.tick();await t.flush();t.ctrl.tick();
+  assert.equal(requests,2);assert.equal(next,2);assert.deepEqual(Array.from(t.doc.querySelectorAll('input')).flatMap((x,i)=>x.checked?[i+1]:[]),[3,5]);t.close();
+});
+
+test('版本号与面板显示一致，下一题开关默认仍需用户开启', () => {
+  const t=setup();const manifest=require('./extension-src/manifest.json');
+  assert.equal(api.VERSION,manifest.version);assert.match(t.ctrl.ui.querySelector('header').textContent,new RegExp(api.VERSION.replace(/\./g,'\\.')));assert.equal(t.ctrl.cfg.examNext,false);t.close();
 });
 test('切换服务商清空旧密钥与模型，避免发到另一个服务商', () => {
   const t = setup('', { apiKey: 'fake-old-key', model: 'old', aiEnabled: true });
